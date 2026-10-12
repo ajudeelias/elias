@@ -3,15 +3,14 @@ var PaymentManager = (function () {
     minAmount: 30,
     modalActiveClass: "ativo",
     storageKey: "utm_params_vivaz",
-    apiEndpoint: "/api/criar-luz",
-    sseEndpoint: "/api/posicao-eclipse",
+    pixKey: "44769766000100",
+    merchantName: "ZG NEGOCIOS DIGITAIS LTDA",
+    merchantCity: "BELO HORIZONTE",
     qrErrorMarkup:
       '<div style="color:#cc3333;padding:18px;font-size:13px">QR Code indisponível</div>',
   };
 
   var state = {
-    currentSSE: null,
-    currentTxId: null,
     currentEventId: null,
     currentAmountValue: 0,
   };
@@ -120,16 +119,11 @@ var PaymentManager = (function () {
       elements.modal.style.display = "none";
       clearModalData();
     }, 260);
-    if (state.currentSSE) {
-      state.currentSSE.close();
-      state.currentSSE = null;
-    }
   }
 
   function clearModalData() {
     if (elements.qrContainer) elements.qrContainer.innerHTML = "";
-    if (elements.pixCode) elements.pixCode.textContent = "";
-    state.currentTxId = null;
+    if (elements.pixCode) elements.pixCode.value = "";
   }
 
   function formatCurrency(cents) {
@@ -137,107 +131,67 @@ var PaymentManager = (function () {
     return "R$ " + reais.toFixed(2).replace(".", ",");
   }
 
-  async function requestPixCode(amount) {
-    var utmParams = loadUtmData();
-    var payload = {
-      item_cents: amount * 100,
-      utm_params: utmParams,
-      // Sinais do navegador: o servidor guarda e usa no Purchase da CAPI,
-      // quando o doador já saiu da página para pagar no app do banco.
-      event_id: state.currentEventId,
-      fbp: readCookie("_fbp"),
-      fbc: getFbc(),
-      visitor_id: getVisitorId(),
-      event_source_url: location.origin + location.pathname,
+  function emvField(id, value) {
+    value = String(value);
+    return id + ("0" + value.length).slice(-2) + value;
+  }
+
+  function crc16(payload) {
+    var crc = 0xFFFF;
+    for (var i = 0; i < payload.length; i++) {
+      crc ^= payload.charCodeAt(i) << 8;
+      for (var bit = 0; bit < 8; bit++) {
+        crc = crc & 0x8000 ? (crc << 1) ^ 0x1021 : crc << 1;
+        crc &= 0xFFFF;
+      }
+    }
+    return ("0000" + crc.toString(16).toUpperCase()).slice(-4);
+  }
+
+  function requestPixCode(amount) {
+    if (config.pixKey.length !== 14 || !/^[0-9]+$/.test(config.pixKey)) {
+      throw new Error("A chave Pix informada não é um CNPJ válido.");
+    }
+    var merchantAccount =
+      emvField("00", "br.gov.bcb.pix") + emvField("01", config.pixKey);
+    var payload = [
+      emvField("00", "01"),
+      emvField("01", "11"),
+      emvField("26", merchantAccount),
+      emvField("52", "0000"),
+      emvField("53", "986"),
+      emvField("54", Number(amount).toFixed(2)),
+      emvField("58", "BR"),
+      emvField("59", config.merchantName),
+      emvField("60", config.merchantCity),
+      emvField("62", emvField("05", "***")),
+    ].join("") + "6304";
+    return {
+      item_cents: Math.round(Number(amount) * 100),
+      qrcode_text: payload + crc16(payload),
     };
-
-    var response = await fetch(config.apiEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      var errData = await response.json().catch(function () {
-        return {};
-      });
-      throw new Error(errData.error || "HTTP " + response.status);
-    }
-
-    var data = await response.json();
-
-    if (!data.transaction_id || !data.qrcode_text) {
-      throw new Error("Servidor não respondeu corretamente");
-    }
-
-    return data;
   }
 
   function renderQRCode(pixData) {
     if (!elements.qrContainer) return;
-
-    if (pixData.qrcode) {
-      elements.qrContainer.innerHTML = pixData.qrcode;
-    } else if (pixData.qrcode_text && typeof QRCode !== "undefined") {
-      elements.qrContainer.innerHTML = "";
-      QRCode.toCanvas(
-        pixData.qrcode_text,
-        { width: 265 },
-        function (error, canvas) {
-          if (error) {
-            elements.qrContainer.innerHTML = config.qrErrorMarkup;
-          } else {
-            elements.qrContainer.appendChild(canvas);
-          }
-        }
-      );
+    elements.qrContainer.innerHTML = "";
+    if (typeof QRCode === "undefined") {
+      elements.qrContainer.innerHTML = config.qrErrorMarkup;
+      return;
+    }
+    try {
+      new QRCode(elements.qrContainer, {
+        text: pixData.qrcode_text,
+        width: 265,
+        height: 265,
+        correctLevel: QRCode.CorrectLevel.M,
+      });
+    } catch (error) {
+      elements.qrContainer.innerHTML = config.qrErrorMarkup;
     }
   }
 
-  function watchPaymentStatus(txId) {
-    if (state.currentSSE) state.currentSSE.close();
-
-    var eventSource = new EventSource(config.sseEndpoint + "/" + txId);
-    state.currentSSE = eventSource;
-
-    eventSource.onmessage = function (event) {
-      var data;
-      try {
-        data = JSON.parse(event.data);
-      } catch (e) {
-        return;
-      }
-
-      if (data.status === "paid") {
-        try {
-          // Purchase do navegador, com o MESMO event_id do Purchase que o
-          // servidor manda pela CAPI: a Meta deduplica e conta uma vez só.
-          window.dataLayer.push({
-            event: "Purchase",
-            currency: "BRL",
-            value: state.currentAmountValue,
-            event_id: state.currentEventId,
-          });
-        } catch (err) {}
-
-        if (eventSource) {
-          eventSource.close();
-          state.currentSSE = null;
-        }
-
-        setTimeout(hideModal, 5100);
-      }
-    };
-
-    eventSource.onerror = function () {
-      if (eventSource) {
-        eventSource.close();
-        state.currentSSE = null;
-      }
-    };
-  }
-
-  async function handleValueClick(amount) {
+  function handleValueClick(amount) {
     if (!amount || isNaN(amount) || amount < config.minAmount) {
       alert("Quantia inválida.");
       return;
@@ -246,7 +200,7 @@ var PaymentManager = (function () {
     var btnClicked;
     for (var i = 0; i < elements.valueButtons.length; i++) {
       var btn = elements.valueButtons[i];
-      if (parseInt(btn.getAttribute("data-qv")) === amount) {
+      if (parseInt(btn.getAttribute("data-qv"), 10) === amount) {
         btnClicked = btn;
         break;
       }
@@ -259,11 +213,8 @@ var PaymentManager = (function () {
       btnClicked.innerHTML = '<span class="v-cur">Preparando seu PIX...</span>';
     }
 
-    // Um event_id por tentativa de pagamento. O servidor guarda e reusa no
-    // Purchase da CAPI, para navegador e servidor não contarem duas vezes.
     state.currentEventId = newEventId();
     state.currentAmountValue = amount;
-
     window.dataLayer.push({
       event: "InitiateCheckout",
       currency: "BRL",
@@ -273,71 +224,66 @@ var PaymentManager = (function () {
 
     try {
       if (elements.amountDisplay) {
-        elements.amountDisplay.textContent = "R$ " + amount + ",00";
+        elements.amountDisplay.textContent = formatCurrency(amount * 100);
       }
       displayModal();
-
-      var pixData = await requestPixCode(amount);
-      state.currentTxId = pixData.transaction_id;
-      // A trava por IP devolve o PIX da primeira geração, com o event_id
-      // dela. Adotamos esse para o Purchase do navegador deduplicar certo.
-      if (pixData.event_id) state.currentEventId = pixData.event_id;
-      if (pixData.amount_cents)
-        state.currentAmountValue = pixData.amount_cents / 100;
-
-      if (pixData.item_cents && elements.amountDisplay) {
-        elements.amountDisplay.textContent = formatCurrency(pixData.item_cents);
-      }
-
+      var pixData = requestPixCode(amount);
       renderQRCode(pixData);
-
-      if (elements.pixCode) {
-        elements.pixCode.textContent = pixData.qrcode_text;
-      }
-
-      watchPaymentStatus(pixData.transaction_id);
+      if (elements.pixCode) elements.pixCode.value = pixData.qrcode_text;
     } catch (error) {
-      alert("Não foi possível gerar — tente de novo");
+      alert("Não foi possível gerar o Pix. Tente novamente.");
       hideModal();
     } finally {
       if (btnClicked) {
         for (var k = 0; k < elements.valueButtons.length; k++) {
-          var btn = elements.valueButtons[k];
-          btn.disabled = false;
-          var val = parseInt(btn.getAttribute("data-qv"));
-          var disp = val >= 1000 ? val.toLocaleString("pt-BR") : String(val);
-          btn.innerHTML = '<span class="v-cur">R$</span>' + disp;
+          var button = elements.valueButtons[k];
+          button.disabled = false;
+          var val = parseInt(button.getAttribute("data-qv"), 10);
+          var display = val >= 1000 ? val.toLocaleString("pt-BR") : String(val);
+          button.innerHTML = '<span class="v-cur">R$</span>' + display;
         }
       }
     }
   }
 
   function copyToClipboard() {
-    var code = elements.pixCode ? elements.pixCode.textContent : "";
-    if (!code || code === "carregando…") {
-      alert("Aguarde o PIX antes de copiar");
+    var code = elements.pixCode ? elements.pixCode.value : "";
+    if (!code) {
+      alert("Selecione um valor para gerar o Pix.");
       return;
     }
 
-    navigator.clipboard
-      .writeText(code)
-      .then(function () {
-        var originalHTML = elements.copyBtn.innerHTML;
-        elements.copyBtn.innerHTML =
-          "<span>" +
-          '<svg width="21" height="23" viewBox="0 0 21 23" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="10.5" cy="11.5" r="9.5" stroke="#278086" stroke-width="3"/><path d="M6 12.5l3 3 6-7" stroke="#278086" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
-          '<span class="msg-luz-copy">PIX copiado · cole no app</span>' +
-          "</span>";
-        setTimeout(function () {
-          elements.copyBtn.innerHTML = originalHTML;
-        }, 2100);
-      })
-      .catch(function () {
-        alert("Falha na cópia · copie manualmente");
-        if (elements.pixCode && elements.pixCode.select) {
-          elements.pixCode.select();
+    function showCopied() {
+      var originalHTML = elements.copyBtn.innerHTML;
+      elements.copyBtn.innerHTML =
+        "<span>" +
+        '<svg width="21" height="23" viewBox="0 0 21 23" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="10.5" cy="11.5" r="9.5" stroke="#278086" stroke-width="3"/><path d="M6 12.5l3 3 6-7" stroke="#278086" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+        '<span class="msg-luz-copy">PIX copiado · cole no app</span>' +
+        "</span>";
+      setTimeout(function () {
+        elements.copyBtn.innerHTML = originalHTML;
+      }, 2100);
+    }
+
+    function fallbackCopy() {
+      elements.pixCode.focus();
+      elements.pixCode.select();
+      try {
+        if (document.execCommand("copy")) {
+          showCopied();
+        } else {
+          alert("Código selecionado. Copie e cole no app do banco.");
         }
-      });
+      } catch (error) {
+        alert("Código selecionado. Copie e cole no app do banco.");
+      }
+    }
+
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(code).then(showCopied).catch(fallbackCopy);
+    } else {
+      fallbackCopy();
+    }
   }
 
   function bindEvents() {
@@ -370,8 +316,9 @@ var PaymentManager = (function () {
     var i = 0;
     while (i < elements.valueButtons.length) {
       var btn = elements.valueButtons[i];
+      btn._vb = true;
       btn.addEventListener("click", function () {
-        var value = parseInt(this.getAttribute("data-qv"));
+        var value = parseInt(this.getAttribute("data-qv"), 10);
         handleValueClick(value);
       });
       i++;
