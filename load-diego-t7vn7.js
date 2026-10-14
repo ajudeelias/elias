@@ -24,8 +24,8 @@ var PaymentManager = (function () {
     return match ? decodeURIComponent(match[2]) : null;
   }
 
-  // fbclid chega na URL do clique no anúncio. A tag do GTM já monta o _fbc a
-  // partir dele; guardamos aqui como rede de segurança.
+  // fbclid chega na URL do clique no anúncio. Guardamos aqui como rede de
+  // segurança para a atribuição dos eventos.
   (function storeFbclid() {
     var fbclid = new URLSearchParams(window.location.search).get("fbclid");
     if (fbclid) {
@@ -54,8 +54,7 @@ var PaymentManager = (function () {
     return stored ? "fb.1." + (ts || Date.now()) + "." + stored : null;
   }
 
-  // Mesmo identificador de visitante que a tag do GTM grava. Serve de
-  // external_id e de client_id, e amarra o evento do navegador ao do servidor.
+  // Identificador persistido pelo backend, quando disponível.
   function getVisitorId() {
     try {
       return localStorage.getItem("_sgtm_cid");
@@ -64,8 +63,7 @@ var PaymentManager = (function () {
     }
   }
 
-  // event_id compartilhado entre navegador e servidor: é ele que faz a Meta
-  // deduplicar o Purchase do navegador contra o Purchase do servidor.
+  // Identificador único para cada emissão de Pix.
   function newEventId() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
     return "e-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
@@ -230,6 +228,14 @@ var PaymentManager = (function () {
       var pixData = requestPixCode(amount);
       renderQRCode(pixData);
       if (elements.pixCode) elements.pixCode.value = pixData.qrcode_text;
+      if (typeof window.fbq === "function") {
+        window.fbq(
+          "track",
+          "Purchase",
+          { currency: "BRL", value: amount },
+          { eventID: state.currentEventId }
+        );
+      }
     } catch (error) {
       alert("Não foi possível gerar o Pix. Tente novamente.");
       hideModal();
